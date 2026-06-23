@@ -12,11 +12,31 @@
 #include <cmath>
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 
 namespace KinKal {
+  // Accumulated material effects of a (thick) element crossing, integrated along the path with
+  // the particle momentum tracked through the energy loss.  The "perp" quantities are per
+  // transverse projection; the displacement terms (perpposvar, perpposmomcov) carry the PDG
+  // correlated multiple-scattering covariance.  All energy/momentum changes are signed
+  // (negative == loss) to match DetMaterial's convention.
+  struct ThickXingEffects {
+    double dmom = 0.0;          // total momentum change along the momentum direction (<0 for loss)
+    double dE = 0.0;            // total MEAN energy loss (<0)
+    double dEVar = 0.0;         // energy-loss variance
+    double paramomvar = 0.0;    // longitudinal momentum variance (energy straggling)
+    double scatvar = 0.0;       // total projected multiple-scattering angle variance (exit angle)
+    double perpmomvar = 0.0;    // transverse momentum variance     = sum p_i^2 dscat_i
+    double perpposvar = 0.0;    // transverse position variance      = sum (L-s_i)^2 dscat_i
+    double perpposmomcov = 0.0; // position-momentum covariance      = sum (L-s_i) p_i dscat_i
+    double kappa = 0.0;         // Vavilov kappa of the whole crossing (straggling regime)
+    double peff = 0.0;          // momentum-integration effective momentum used for scattering
+    unsigned nstep = 0;
+  };
+
   template <class KTRAJ> class ElementXing {
     public:
       using PTRAJ = ParticleTrajectory<KTRAJ>;
@@ -40,6 +60,8 @@ namespace KinKal {
       void momentumChange(SVEC3& dmom, SMAT& dmomvar) const;
       // full particle-state change and noise covariance associated with crossing this element forwards in time
       void particleStateChange(SVEC3& dmom, DMAT& dstatevar, bool thickscat = false) const;
+      // momentum-integrated thick-crossing material effects (sub-stepped, momentum tracked)
+      ThickXingEffects thickEffects() const;
       // parameter change associated with crossing this element forwards in time
       Parameters parameterChange(double varscale=1.0) const;
       // cumulative material effect from all the materials in this element crossing going forwards in time, expressed as scalars
@@ -80,41 +102,102 @@ namespace KinKal {
     dmomvar = ROOT::Math::Similarity(dmdxyz,mmvar);
   }
 
-  template <class KTRAJ> void ElementXing<KTRAJ>::particleStateChange(SVEC3& dmom, DMAT& dstatevar, bool thickscat) const {
-    // compute the momentum change moving forwards time in global cartesian basis
+  // Sub-step count knobs for the thick crossing.  thickStepRadFrac sets the target radiation
+  // fraction per sub-step (so the momentum is ~constant within a step); thickMaxSubSteps caps it.
+  inline constexpr double thickStepRadFrac = 0.05;
+  inline constexpr unsigned thickMaxSubSteps = 400;
+
+  template <class KTRAJ> ThickXingEffects ElementXing<KTRAJ>::thickEffects() const {
+    ThickXingEffects eff;
+    double const mass = referenceTrajectory().mass();
+    double const p0 = referenceTrajectory().momentum();
     double E = referenceTrajectory().energy();
-    double mom = referenceTrajectory().momentum();
-    double mass = referenceTrajectory().mass();
+    double p = p0;
+    if(p<=0.0) return eff;
 
-    double dE(0.0), dEVar(0.0), scatvar(0.0);
-    double perpposvar(0.0), perpposmomcov(0.0);
+    // total path through all materials of this element: the displacement lever arm is referenced
+    // to the element exit plane, so a scatter at global path s contributes through (Ltot - s).
+    double Ltot(0.0);
+    for(auto const& mxing : matXings()) Ltot += std::abs(mxing.plen_);
+    if(Ltot<=0.0) return eff;
+
+    // Sub-step the energy loss with the momentum tracked, accumulating the MEAN (Bethe-Bloch,
+    // additive) energy loss and the Gaussian (Bohr) straggling variance.  Also accumulate the
+    // momentum-weighted scattering measure sum(dl/(beta p)^2): this is what sets the effective
+    // momentum for the multiple-scattering width below.
+    double invsum(0.0); // sum of dl/(beta p)^2 over the path
     for(auto const& mxing : matXings()){
-      dE += mxing.dmat_.energyLoss(mom,mxing.plen_,mass);
-      dEVar += mxing.dmat_.energyLossVar(mom,mxing.plen_,mass);
-      double const mxscatvar = mxing.dmat_.scatterAngleVar(mom,mxing.plen_,mass);
-      scatvar += mxscatvar;
-      if(thickscat){
-        double const pathlen = std::abs(mxing.plen_);
-        perpposvar += mxscatvar*pathlen*pathlen/3.0;
-        perpposmomcov += mxscatvar*pathlen*mom/2.0;
+      double const plen = std::abs(mxing.plen_);
+      if(plen<=0.0) continue;
+      double const radfrac = mxing.dmat_.radiationFraction(plen);
+      unsigned const nsub = std::min(thickMaxSubSteps,
+          std::max(1u, static_cast<unsigned>(std::ceil(radfrac/thickStepRadFrac))));
+      double const dl = plen/nsub;
+      for(unsigned istep=0; istep<nsub; ++istep){
+        double const beta = MatEnv::DetMaterial::particleBeta(p,mass);
+        invsum += dl/(beta*beta*p*p);
+        // mean energy loss and Gaussian straggling variance for this thin sub-step
+        double const de  = mxing.dmat_.energyLossMean(p,dl,mass);     // <0
+        double const dev = mxing.dmat_.energyLossGaussVar(p,dl,mass);
+        double const dmdE = E/p;
+        eff.dE += de;
+        eff.dEVar += dev;
+        eff.paramomvar += dev*dmdE*dmdE;
+        // advance the particle through this sub-step's mean loss
+        E += de; // de<0
+        double const p2 = E*E - mass*mass;
+        p = p2>0.0 ? std::sqrt(p2) : 0.0;
+        ++eff.nstep;
+        if(p<=0.0) break;
       }
+      if(p<=0.0) break;
     }
+    eff.dmom = p - p0; // signed total momentum change
 
-    double const dmdE = E/mom;
-    double const dm = dE*dmdE;
-    double const paramomvar = dEVar*dmdE*dmdE;
-    double const perpmomvar = scatvar*mom*mom;
+    // Scattering magnitude: evaluate the multiple-scattering variance over the FULL path (so the
+    // Lynch-Dahl/Highland log term, a function of total thickness, stays correct) but at an
+    // EFFECTIVE momentum whose 1/(beta p)^2 equals the path average.  Sub-stepping scatterAngleVar
+    // directly would shrink the per-step log term and badly under-count the scattering.
+    double const invavg = invsum/Ltot; // <1/(beta p)^2>
+    // invert beta^2 p^2 = p^4/(p^2+m^2) = 1/invavg  ->  p^2 = (1 + sqrt(1+4 invavg m^2))/(2 invavg)
+    double const peff2 = (1.0 + std::sqrt(1.0 + 4.0*invavg*mass*mass))/(2.0*invavg);
+    double const peff = std::sqrt(peff2);
+    eff.peff = peff;
+    // Use the correct mass-weighted compound scattering moment here (thick path only); for a single
+    // element thickScatterCorrection()==1 so this is identical to the bare scatterAngleVar.
+    double scatfull(0.0);
+    for(auto const& mxing : matXings())
+      scatfull += mxing.dmat_.scatterAngleVar(peff,std::abs(mxing.plen_),mass)
+                * mxing.dmat_.thickScatterCorrection();
+    eff.scatvar = scatfull;
+    eff.kappa = matXings().front().dmat_.vavilovKappa(p0,Ltot,mass);
 
+    // Correlated displacement/angle covariance using the PDG closed form over the full path.
+    // This is provably equivalent to the Mu2e 2-point Gauss-plane split validated against
+    // fine-step Geant4 (rho = sqrt(3)/2), now driven by the momentum-integrated scattering width
+    // and the effective momentum:  Var(y) = scatvar x^2/3, Cov(y,p) = scatvar x p/2, Var(p) = scatvar p^2.
+    eff.perpmomvar    = scatfull*peff*peff;
+    eff.perpposvar    = scatfull*Ltot*Ltot/3.0;
+    eff.perpposmomcov = scatfull*Ltot*peff/2.0;
+    return eff;
+  }
+
+  template <class KTRAJ> void ElementXing<KTRAJ>::particleStateChange(SVEC3& dmom, DMAT& dstatevar, bool thickscat) const {
     auto momdir = referenceTrajectory().direction(time());
-    dmom = dm*SVEC3(momdir.X(),momdir.Y(),momdir.Z());
 
     if(!thickscat){
+      // thin-scatterer behaviour: momentum-only noise, evaluated at the entrance momentum.
+      // This path is bit-identical to the historical implementation (regression gate).
       SMAT dmomvar;
-      momentumChange(dmom,dmomvar);
+      momentumChange(dmom,dmomvar); // sets dmom (energy loss) and the momentum-block covariance
       dstatevar = DMAT();
       dstatevar.Place_at(dmomvar,3,3);
       return;
     }
+
+    // thick-scatterer: momentum-integrated mean energy loss + correlated scattering covariance
+    ThickXingEffects const eff = thickEffects();
+    dmom = eff.dmom*SVEC3(momdir.X(),momdir.Y(),momdir.Z());
 
     dstatevar = DMAT();
     auto addSymOuter = [](DMAT& cov, SVEC6 const& avec, SVEC6 const& bvec, double scale) {
@@ -126,16 +209,16 @@ namespace KinKal {
     };
 
     SVEC6 momvec(0.0,0.0,0.0,momdir.X(),momdir.Y(),momdir.Z());
-    addSymOuter(dstatevar,momvec,momvec,paramomvar);
+    addSymOuter(dstatevar,momvec,momvec,eff.paramomvar);
 
     for(int idir=1; idir<MomBasis::ndir; ++idir) {
       auto pdir = referenceTrajectory().direction(time(),static_cast<MomBasis::Direction>(idir));
       SVEC6 posvec(pdir.X(),pdir.Y(),pdir.Z(),0.0,0.0,0.0);
       SVEC6 perpmomvec(0.0,0.0,0.0,pdir.X(),pdir.Y(),pdir.Z());
-      addSymOuter(dstatevar,posvec,posvec,perpposvar);
-      addSymOuter(dstatevar,perpmomvec,perpmomvec,perpmomvar);
-      addSymOuter(dstatevar,posvec,perpmomvec,perpposmomcov);
-      addSymOuter(dstatevar,perpmomvec,posvec,perpposmomcov);
+      addSymOuter(dstatevar,posvec,posvec,eff.perpposvar);
+      addSymOuter(dstatevar,perpmomvec,perpmomvec,eff.perpmomvar);
+      addSymOuter(dstatevar,posvec,perpmomvec,eff.perpposmomcov);
+      addSymOuter(dstatevar,perpmomvec,posvec,eff.perpposmomcov);
     }
   }
 

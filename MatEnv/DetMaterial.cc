@@ -15,6 +15,8 @@
 //           Orion Ning, 01/12/21
 //------------------------------------------------------------------------------
 #include "KinKal/MatEnv/DetMaterial.hh"
+#include "KinKal/MatEnv/ElmPropObj.hh"
+#include "KinKal/MatEnv/MtrPropObj.hh"
 #include <iostream>
 #include <cfloat>
 #include <string>
@@ -69,6 +71,27 @@ namespace MatEnv {
     _chic2 = 1.57e1*_zeff*(_zeff+1)/_aeff;
     _chia2_1 = 2.007e-5*pow(_zeff,2.0/3.0);
     _chia2_2 = 3.34*pow(_zeff*_alpha,2);
+    // Thick-material-only scattering correction (does NOT touch _chic2 / scatterAngleVar above):
+    // _chic2 uses the lumped effective-Z moment Z_eff(Z_eff+1)/A_eff, which under-counts a compound's
+    // true scattering power sum_i w_i Z_i(Z_i+1)/A_i (since <Z>^2 < <Z^2>). Cache the ratio so the
+    // thick-scatter extrapolation path can recover the correct compound multiple-scattering variance
+    // without changing any in-fit behaviour. Reduces to exactly 1 for a single element.
+    _thickscatcor = 1.0;
+    {
+      double const seff = _zeff*(_zeff+1.0)/_aeff;
+      auto const* elements = detMtrProp->getElementVector();
+      auto const& fracs = detMtrProp->getFractionVector();
+      size_t const nel = detMtrProp->getNumberOfElements();
+      if(elements != nullptr && nel > 1 && seff > 0.0 && fracs.size() >= nel){
+        double strue = 0.0;
+        for(size_t i=0; i<nel; ++i){
+          double const zi = (*elements)[i]->getZ();
+          double const ai = (*elements)[i]->getA();
+          if(ai > 0.0) strue += fracs[i]*zi*(zi+1.0)/ai;
+        }
+        if(strue > 0.0) _thickscatcor = strue/seff;
+      }
+    }
 
     if (detMtrProp->getState() == "gas" && detMtrProp->getDensity()<0.01) {
       _scatterfrac = dmconf.scatterfrac_gas_;
@@ -171,6 +194,77 @@ namespace MatEnv {
       return deltap;
     } else
       return 0.0;
+  }
+
+  // Maximum energy transferred to a free electron in a single collision (PRP eq. 34.4)
+  double DetMaterial::maxEnergyTransfer(double mom, double mass) const {
+    if(mom>0.0){
+      double gamma = particleGamma(mom,mass);
+      double beta = particleBeta(mom,mass);
+      double bg = beta*gamma;
+      double ratio = e_mass_/mass;
+      return 2.0*e_mass_*bg*bg/(1.0 + 2.0*gamma*ratio + ratio*ratio);
+    } else
+      return 0.0;
+  }
+
+  // Vavilov parameter kappa = xi/Tmax; selects the straggling regime
+  double DetMaterial::vavilovKappa(double mom, double pathlen, double mass) const {
+    if(mom>0.0){
+      double beta = particleBeta(mom,mass);
+      double xi = eloss_xi(beta,pathlen);
+      double tmax = maxEnergyTransfer(mom,mass);
+      return tmax>0.0 ? xi/tmax : 0.0;
+    } else
+      return 0.0;
+  }
+
+  // MEAN ionization energy loss from the Bethe-Bloch mean (PRP eq. 34.5), NOT the most-probable
+  // value.  In the form used here xi == (K/2)(Z/A)(rho x / beta^2), so the standard
+  //   -dE/dx = K (Z/A)(1/beta^2)[ 0.5 ln(2 me c^2 beta^2 gamma^2 Tmax / I^2) - beta^2 - delta/2 ]
+  // multiplied by rho x becomes
+  //   <dE> = xi [ ln(2 me c^2 beta^2 gamma^2 Tmax / I^2) - 2 beta^2 - delta - 2 sh ].
+  // Unlike ionizationEnergyLossMPV this is additive in path length, so integrating it over
+  // sub-steps along a decelerating track yields an unbiased mean.
+  double DetMaterial::ionizationEnergyLossMean(double mom, double pathlen, double mass) const {
+    if(mom>0.0){
+      pathlen = fabs(pathlen);
+      double beta  = particleBeta(mom,mass);
+      double gamma = particleGamma(mom,mass);
+      double beta2 = beta*beta;
+      double bg2 = beta2*gamma*gamma;
+      double tau = gamma-1;
+      double xi = eloss_xi(beta,pathlen);
+      double tmax = maxEnergyTransfer(mom,mass);
+      double delta = densityCorrection(bg2);
+      double sh = shellCorrection(bg2,tau);
+      double mean = log(2.0*e_mass_*bg2*tmax/(_eexc*_eexc)) - 2.0*beta2 - delta - 2.0*sh;
+      mean *= xi;
+      return -mean; // negative == energy loss, matching energyLoss() sign convention
+    } else
+      return 0.0;
+  }
+
+  double DetMaterial::energyLossMean(double mom,double pathlen,double mass) const {
+    return ionizationEnergyLossMean(mom,pathlen,mass) + radiationEnergyLoss(mom,pathlen,mass);
+  }
+
+  // Gaussian/Bohr ionization energy-loss variance (PRP eq. 34.9): sigma^2 = xi Tmax (1 - beta^2/2).
+  // This is the true second moment of the Tmax-truncated straggling distribution and is valid
+  // across regimes; in the thick limit the distribution itself becomes Gaussian (central limit).
+  double DetMaterial::ionizationEnergyLossGaussVar(double mom,double pathlen,double mass) const {
+    if(mom>0.0){
+      double beta = particleBeta(mom,mass);
+      double beta2 = beta*beta;
+      double xi = eloss_xi(beta,pathlen);
+      double tmax = maxEnergyTransfer(mom,mass);
+      return xi*tmax*(1.0 - 0.5*beta2);
+    } else
+      return 0.0;
+  }
+
+  double DetMaterial::energyLossGaussVar(double mom,double pathlen,double mass) const {
+    return ionizationEnergyLossGaussVar(mom,pathlen,mass) + radiationEnergyLossVar(mom,pathlen,mass);
   }
 
   double DetMaterial::radiationEnergyLoss(double mom,double pathlen, double mass) const {

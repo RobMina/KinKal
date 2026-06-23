@@ -49,7 +49,10 @@ struct Config {
   std::string material = "CONCRETE_MARS";
   std::string physicsList = "ShieldingM";
   long seed = 12345;
+  bool predictOnly = false;    // skip Geant4 entirely; emit only the KinKal + two-plane predictions
 };
+
+constexpr double kMuonMassMeV = 105.6583745;
 
 struct Moments {
   int n = 0;
@@ -88,46 +91,68 @@ struct ElementSpec {
   char const* name;
   double z;
   double a;
-  double fraction;
+  double fraction; // mass fraction
 };
 
-std::vector<ElementSpec> concreteMarsElements() {
-  return {
-    {"H",  1.0,  1.00794,  0.006},
-    {"C",  6.0, 12.0107,   0.030},
-    {"O",  8.0, 15.9994,   0.500},
-    {"Na",11.0, 22.989770, 0.010},
-    {"Al",13.0, 26.981538, 0.030},
-    {"Si",14.0, 28.0855,   0.200},
-    {"K", 19.0, 39.0983,   0.010},
-    {"Ca",20.0, 40.078,    0.200},
-    {"Fe",26.0, 55.845,    0.014}
-  };
+struct MaterialSpec {
+  double density; // g/cm3
+  std::vector<ElementSpec> elements;
+};
+
+// Shared material registry used by BOTH the Geant4 detector and the KinKal DetMaterial, so the
+// two sides see identical composition and density.  CONCRETE_MARS is the Mu2e ExtShield concrete;
+// ALUMINUM and IRON span the low-Z / high-Z ends needed to exercise the dE/dx-vs-scattering
+// Z-moment decoupling (design note section 1.1) — a concrete-only scan cannot test that.
+MaterialSpec materialSpec(std::string const& name) {
+  if(name == "CONCRETE_MARS") {
+    return {2.35, {
+      {"H",  1.0,  1.00794,  0.006}, {"C",  6.0, 12.0107,   0.030},
+      {"O",  8.0, 15.9994,   0.500}, {"Na",11.0, 22.989770, 0.010},
+      {"Al",13.0, 26.981538, 0.030}, {"Si",14.0, 28.0855,   0.200},
+      {"K", 19.0, 39.0983,   0.010}, {"Ca",20.0, 40.078,    0.200},
+      {"Fe",26.0, 55.845,    0.014}
+    }};
+  }
+  if(name == "ALUMINUM") return {2.699, {{"Al",13.0,26.981538,1.0}}};
+  if(name == "IRON")     return {7.874, {{"Fe",26.0,55.845,  1.0}}};
+  // --- Mu2eKinKal composite materials along the tracker->CRV path, from
+  //     Offline/TrackerConditions/data/MaterialsList.data, resolved to element mass fractions. ---
+  // DS coils (collapsed), Al + NbTi(0.65 Nb / 0.35 Ti).  Wide Z-spread (13,41,22): predicted +8% scatter.
+  if(name == "DSCOILMIX") return {3.20323, {
+    {"Al",13.0,26.981539,0.732270}, {"Nb",41.0,92.906380,0.174025}, {"Ti",22.0,47.880000,0.093706}}};
+  // DS cryostat shells.  Near-mono-Z (Cr/Mn/Fe/Ni 24-28 + 1% Si): predicted ~0% (the control case).
+  if(name == "STAINLESSSTEEL") return {8.02, {
+    {"Mn",25.0,54.938049,0.02}, {"Si",14.0,28.085500,0.01}, {"Cr",24.0,51.996100,0.19},
+    {"Ni",28.0,58.693400,0.10}, {"Fe",26.0,55.845000,0.68}}};
+  // Tracker straw wall (Mylar + Au + Al traces).  Low-Z C/O/H with a Z=79 trace: predicted +18% scatter.
+  if(name == "STRAWWALL") return {1.4325, {
+    {"C", 6.0,12.011000,0.605961}, {"O", 8.0,15.999400,0.322870}, {"H", 1.0,1.007940,0.040680},
+    {"Au",79.0,196.966540,0.018}, {"Al",13.0,26.981539,0.012489}}};
+  throw std::runtime_error("Unknown material " + name);
 }
 
 std::unique_ptr<MatEnv::DetMaterial> makeKinKalMaterial(std::string const& name) {
-  if(name != "CONCRETE_MARS") {
-    throw std::runtime_error("KinKal side currently supports CONCRETE_MARS only");
-  }
+  MaterialSpec const spec = materialSpec(name);
+  auto const& els = spec.elements;
 
-  std::vector<int> iflg(concreteMarsElements().size(), 0);
+  std::vector<int> iflg(els.size(), 0);
   std::vector<double> weights;
   std::vector<std::string> componentNames;
-  weights.reserve(concreteMarsElements().size());
-  componentNames.reserve(concreteMarsElements().size());
-  for(auto const& elem : concreteMarsElements()) {
+  weights.reserve(els.size());
+  componentNames.reserve(els.size());
+  for(auto const& elem : els) {
     weights.push_back(elem.fraction);
     componentNames.emplace_back(elem.name);
   }
 
-  MatEnv::MatMaterialObj material(name, 2.35, 0.0, 0.0,
-      static_cast<int>(concreteMarsElements().size()), &iflg, &weights,
+  MatEnv::MatMaterialObj material(name, spec.density, 0.0, 0.0,
+      static_cast<int>(els.size()), &iflg, &weights,
       &componentNames, -1.0, -1.0, 0.0, 0.0, 0.0, "solid");
   auto properties = std::make_unique<MatEnv::MtrPropObj>(&material);
 
   std::vector<std::unique_ptr<MatEnv::ElmPropObj>> elements;
-  elements.reserve(concreteMarsElements().size());
-  for(auto const& elem : concreteMarsElements()) {
+  elements.reserve(els.size());
+  for(auto const& elem : els) {
     elements.emplace_back(std::make_unique<MatEnv::ElmPropObj>(elem.name, elem.z, elem.a));
     properties->AddElement(elements.back().get(), elem.fraction);
   }
@@ -191,6 +216,12 @@ struct KinKalPrediction {
   double covXX = 0.0;
   double covPX = 0.0;
   double covPXPX = 0.0;
+  double kappa = 0.0;
+  double peff = 0.0;
+  unsigned nstep = 0;
+  double peffSingle = 0.0;
+  double scatSingle = 0.0;
+  double dESingle = 0.0;
 };
 
 KinKalPrediction runKinKalPrediction(Config const& cfg, double muonMass) {
@@ -199,14 +230,18 @@ KinKalPrediction runKinKalPrediction(Config const& cfg, double muonMass) {
   KinKal::SVEC3 dmom;
   KinKal::DMAT cov;
   xing.particleStateChange(dmom, cov, true);
+  // pull the momentum-integrated scalars from the same code path the covariance is built from
+  KinKal::ThickXingEffects const eff = xing.thickEffects();
 
   KinKalPrediction pred;
   pred.radlen = material->radiationLength()/material->density();
   pred.xOverX0 = material->radiationFraction(cfg.thickness);
-  pred.energyLoss = -material->energyLoss(cfg.momentum, cfg.thickness, muonMass);
-  pred.energyLossRms = material->energyLossRMS(cfg.momentum, cfg.thickness, muonMass);
-  pred.scatterAngleVar = material->scatterAngleVar(cfg.momentum, cfg.thickness, muonMass);
-  pred.sigmaTheta = std::sqrt(pred.scatterAngleVar);
+  // mean / RMS energy loss now come from the sub-stepped Bethe-Bloch mean + Gaussian straggling
+  pred.energyLoss = -eff.dE;
+  pred.energyLossRms = std::sqrt(std::max(0.0, eff.dEVar));
+  // scattering width is the momentum-integrated (effective-momentum, full-path) projected variance
+  pred.scatterAngleVar = eff.scatvar;
+  pred.sigmaTheta = std::sqrt(std::max(0.0, eff.scatvar));
   pred.sigmaPos = std::sqrt(cov(0,0));
   pred.posMomCov = cov(0,3);
   pred.corr = cov(0,3)/(std::sqrt(cov(0,0))*std::sqrt(cov(3,3)));
@@ -214,7 +249,65 @@ KinKalPrediction runKinKalPrediction(Config const& cfg, double muonMass) {
   pred.covXX = cov(0,0);
   pred.covPX = cov(0,3);
   pred.covPXPX = cov(3,3);
+  // diagnostics from the momentum integration
+  pred.kappa = eff.kappa;
+  pred.peff = eff.peff;
+  pred.nstep = eff.nstep;
+  pred.peffSingle = cfg.momentum;
+  pred.scatSingle = std::sqrt(material->scatterAngleVar(cfg.momentum, cfg.thickness, muonMass));
+  pred.dESingle = -material->energyLoss(cfg.momentum, cfg.thickness, muonMass);
   return pred;
+}
+
+// Faithful reproduction of the Mu2e KinKalGeomMaker "two-plane" workaround (design note section 3):
+// the slab is split into two thin Gauss-point scatterers at center +/- t/(2 sqrt3), each carrying
+// HALF the material, propagated to the exit by the extrapolator's transport.  This is the prior
+// state of the art in Mu2eKinKal.  It uses the UNMODIFIED thin physics (Moyal mean energy loss,
+// Lynch-Dahl scattering, Moyal straggling), evaluated over half-thickness at each plane, with the
+// momentum tracked from plane 1 to plane 2 (a coarse 2-point integration).
+struct TwoPlanePrediction {
+  double sigmaTheta = 0.0;
+  double sigmaPos = 0.0;
+  double corr = 0.0;
+  double energyLoss = 0.0;
+  double energyLossRms = 0.0;
+};
+
+TwoPlanePrediction runTwoPlanePrediction(Config const& cfg, double muonMass) {
+  auto material = makeKinKalMaterial(cfg.material);
+  double const L = cfg.thickness;
+  double const half = 0.5*L;                 // material path carried by each plane
+  double const offset = L/(2.0*std::sqrt(3.0));
+  double const s1 = 0.5*L - offset;          // Gauss-point positions from the slab entry
+  double const s2 = 0.5*L + offset;
+  double const lever1 = L - s1;              // distance from each plane to the exit face
+  double const lever2 = L - s2;
+
+  double const p0 = cfg.momentum;
+  double const E0 = std::sqrt(p0*p0 + muonMass*muonMass);
+  // plane 1 at the entrance momentum
+  double const sv1 = material->scatterAngleVar(p0, half, muonMass);
+  double const de1 = material->energyLoss(p0, half, muonMass);     // <0 (Moyal mean)
+  double const dev1 = material->energyLossVar(p0, half, muonMass);
+  // advance the momentum through plane 1's mean loss, then plane 2
+  double const E1 = E0 + de1;
+  double const p1 = std::sqrt(std::max(0.0, E1*E1 - muonMass*muonMass));
+  double const sv2 = material->scatterAngleVar(p1, half, muonMass);
+  double const de2 = material->energyLoss(p1, half, muonMass);
+  double const dev2 = material->energyLossVar(p1, half, muonMass);
+
+  double const scatvar = sv1 + sv2;                                  // exit angle variance
+  double const perpposvar = lever1*lever1*sv1 + lever2*lever2*sv2;   // transported displacement
+  double const perpmomvar = p0*p0*sv1 + p1*p1*sv2;                   // transverse momentum
+  double const perpposmomcov = lever1*p0*sv1 + lever2*p1*sv2;
+
+  TwoPlanePrediction tp;
+  tp.sigmaTheta = std::sqrt(std::max(0.0, scatvar));
+  tp.sigmaPos = std::sqrt(std::max(0.0, perpposvar));
+  tp.corr = perpposmomcov/std::sqrt(perpposvar*perpmomvar);
+  tp.energyLoss = -(de1 + de2);
+  tp.energyLossRms = std::sqrt(std::max(0.0, dev1 + dev2));
+  return tp;
 }
 
 class SlabDetector : public G4VUserDetectorConstruction {
@@ -247,22 +340,14 @@ public:
 
 private:
   static G4Material* findOrBuildMaterial(std::string const& name) {
-    if(name == "CONCRETE_MARS"){
-      if(auto* existing = G4Material::GetMaterial(name, false)) return existing;
-      auto* nist = G4NistManager::Instance();
-      auto* concrete = new G4Material(name, 2.35*g/cm3, 9);
-      concrete->AddElement(nist->FindOrBuildElement("H"),  0.006);
-      concrete->AddElement(nist->FindOrBuildElement("C"),  0.030);
-      concrete->AddElement(nist->FindOrBuildElement("O"),  0.500);
-      concrete->AddElement(nist->FindOrBuildElement("Na"), 0.010);
-      concrete->AddElement(nist->FindOrBuildElement("Al"), 0.030);
-      concrete->AddElement(nist->FindOrBuildElement("Si"), 0.200);
-      concrete->AddElement(nist->FindOrBuildElement("K"),  0.010);
-      concrete->AddElement(nist->FindOrBuildElement("Ca"), 0.200);
-      concrete->AddElement(nist->FindOrBuildElement("Fe"), 0.014);
-      return concrete;
-    }
-    return G4NistManager::Instance()->FindOrBuildMaterial(name);
+    if(auto* existing = G4Material::GetMaterial(name, false)) return existing;
+    // build from the shared registry so Geant4 and KinKal use identical composition + density
+    MaterialSpec const spec = materialSpec(name);
+    auto* nist = G4NistManager::Instance();
+    auto* mat = new G4Material(name, spec.density*g/cm3, static_cast<int>(spec.elements.size()));
+    for(auto const& elem : spec.elements)
+      mat->AddElement(nist->FindOrBuildElement(elem.name), elem.fraction);
+    return mat;
   }
 
   Config const& cfg_;
@@ -384,10 +469,11 @@ Config parseArgs(int argc, char** argv) {
     else if(arg == "--material") cfg.material = value(arg);
     else if(arg == "--physics-list") cfg.physicsList = value(arg);
     else if(arg == "--seed") cfg.seed = std::atol(value(arg).c_str());
+    else if(arg == "--predict-only") cfg.predictOnly = true;
     else if(arg == "--help"){
       std::cout << "Usage: ThickSlabG4 [--events N] [--momentum MeV] "
                    "[--thickness mm] [--max-step mm] [--material NAME] "
-                   "[--physics-list NAME] [--seed N]\n";
+                   "[--physics-list NAME] [--seed N] [--predict-only]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("Unknown argument " + arg);
@@ -406,6 +492,38 @@ double highlandTheta0(double momentum, double mass, double thickness, double rad
 
 int main(int argc, char** argv) {
   Config const cfg = parseArgs(argc, argv);
+
+  if(cfg.predictOnly){
+    // Geant4-free path: the KinKal + two-plane predictions are deterministic, so the full
+    // material x thickness x momentum grid can be swept in milliseconds per cell.  Geant4 is
+    // reserved for a validation subset (run without --predict-only).
+    auto const kinkal = runKinKalPrediction(cfg, kMuonMassMeV);
+    auto const twoplane = runTwoPlanePrediction(cfg, kMuonMassMeV);
+    std::cout << std::setprecision(6)
+              << "predict_only 1\n"
+              << "material " << cfg.material << "\n"
+              << "momentum_MeVc " << cfg.momentum << "\n"
+              << "thickness_mm " << cfg.thickness << "\n"
+              << "kinkal_radlen_mm " << kinkal.radlen << "\n"
+              << "kinkal_x_over_x0 " << kinkal.xOverX0 << "\n"
+              << "kinkal_nsubsteps " << kinkal.nstep << "\n"
+              << "kinkal_vavilov_kappa " << kinkal.kappa << "\n"
+              << "kinkal_p_eff_MeVc " << kinkal.peff << "\n"
+              << "kinkal_sigma_theta " << kinkal.sigmaTheta << "\n"
+              << "kinkal_sigma_theta_singlestep " << kinkal.scatSingle << "\n"
+              << "kinkal_sigma_pos_mm " << kinkal.sigmaPos << "\n"
+              << "kinkal_corr_x_theta " << kinkal.corr << "\n"
+              << "kinkal_mean_dE_MeV " << kinkal.energyLoss << "\n"
+              << "kinkal_mean_dE_singlestep_MeV " << kinkal.dESingle << "\n"
+              << "kinkal_rms_dE_MeV " << kinkal.energyLossRms << "\n"
+              << "twoplane_sigma_theta " << twoplane.sigmaTheta << "\n"
+              << "twoplane_sigma_pos_mm " << twoplane.sigmaPos << "\n"
+              << "twoplane_corr_x_theta " << twoplane.corr << "\n"
+              << "twoplane_mean_dE_MeV " << twoplane.energyLoss << "\n"
+              << "twoplane_rms_dE_MeV " << twoplane.energyLossRms << "\n";
+    return 0;
+  }
+
   CLHEP::HepRandom::setTheSeed(cfg.seed);
 
   auto* runManager = new G4RunManager;
@@ -431,6 +549,7 @@ int main(int argc, char** argv) {
   double const dedx = emcalc.ComputeTotalDEDX(kinE*MeV, muon, detector->slabMaterial())/(MeV/mm);
   double const predDE = dedx*cfg.thickness;
   auto const kinkal = runKinKalPrediction(cfg, mass);
+  auto const twoplane = runTwoPlanePrediction(cfg, mass);
 
   double const sx = std::sqrt(moments.var(moments.sx, moments.sx2));
   double const sy = std::sqrt(moments.var(moments.sy, moments.sy2));
@@ -457,8 +576,18 @@ int main(int argc, char** argv) {
             << "theta0_pred " << theta0 << "\n"
             << "kinkal_radlen_mm " << kinkal.radlen << "\n"
             << "kinkal_x_over_x0 " << kinkal.xOverX0 << "\n"
+            << "kinkal_nsubsteps " << kinkal.nstep << "\n"
+            << "kinkal_vavilov_kappa " << kinkal.kappa << "\n"
+            << "kinkal_p_eff_MeVc " << kinkal.peff << "\n"
             << "kinkal_scatter_angle_var " << kinkal.scatterAngleVar << "\n"
             << "kinkal_sigma_theta " << kinkal.sigmaTheta << "\n"
+            << "kinkal_sigma_theta_singlestep " << kinkal.scatSingle << "\n"
+            << "kinkal_mean_dE_singlestep_MeV " << kinkal.dESingle << "\n"
+            << "twoplane_sigma_theta " << twoplane.sigmaTheta << "\n"
+            << "twoplane_sigma_pos_mm " << twoplane.sigmaPos << "\n"
+            << "twoplane_corr_x_theta " << twoplane.corr << "\n"
+            << "twoplane_mean_dE_MeV " << twoplane.energyLoss << "\n"
+            << "twoplane_rms_dE_MeV " << twoplane.energyLossRms << "\n"
             << "kinkal_sigma_pos_mm " << kinkal.sigmaPos << "\n"
             << "kinkal_corr_x_theta " << kinkal.corr << "\n"
             << "kinkal_mean_dE_MeV " << kinkal.energyLoss << "\n"

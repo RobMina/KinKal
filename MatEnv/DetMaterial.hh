@@ -64,6 +64,20 @@ namespace MatEnv {
         double elrms = ionizationEnergyLossRMS(mom,pathlen,mass);
         return elrms*elrms;
       }
+      // MEAN ionization energy loss (Bethe-Bloch mean, NOT the Moyal/MPV reconstruction).
+      // This is the correct, callable Bethe-Bloch a client needs for a thick slab: it is
+      // additive in path length (sum over sub-steps == single evaluation, unlike the MPV),
+      // so integrating it along a decelerating track gives an unbiased mean energy loss.
+      double ionizationEnergyLossMean(double mom,double pathlen,double mass) const;
+      double energyLossMean(double mom,double pathlen,double mass) const;
+      // Gaussian (Bohr) ionization energy-loss variance, appropriate in the thick (large-kappa)
+      // straggling regime where the central-limit theorem drives the loss distribution Gaussian.
+      double ionizationEnergyLossGaussVar(double mom,double pathlen,double mass) const;
+      double energyLossGaussVar(double mom,double pathlen,double mass) const;
+      // maximum energy transfer to an atomic electron in a single collision (kinematic Tmax)
+      double maxEnergyTransfer(double mom,double mass) const;
+      // Vavilov kappa = xi/Tmax: selects the straggling regime (Landau <<1, Vavilov ~1, Gaussian >>1)
+      double vavilovKappa(double mom,double pathlen,double mass) const;
       // radiation (brehmsstrahlung) energy loss calculation. This is relevant only for electrons
       //
       double radiationEnergyLoss(double mom,double pathlen, double mass) const;
@@ -143,6 +157,12 @@ namespace MatEnv {
       double _chic2;
       double _chia2_1;
       double _chia2_2;
+      // Thick-material-ONLY multiple-scattering correction (default 1): ratio of the true
+      // mass-weighted compound moment sum_i w_i Z_i(Z_i+1)/A_i to the lumped effective-Z moment
+      // Z_eff(Z_eff+1)/A_eff that _chic2/scatterAngleVar use. >1 for a compound (Jensen), exactly 1
+      // for a single element. Consumed ONLY by the thick-scatter extrapolation path; scatterAngleVar
+      // and every existing fit are unchanged.
+      double _thickscatcor;
 
     public:
       // baseic accessors
@@ -160,6 +180,9 @@ namespace MatEnv {
       double bigC()const {return _bigc;}
       double density()const {return _density;}
       double inverseX0() const { return _invx0; }
+      // multiplicative correction to scatterAngleVar's VARIANCE recovering the true mass-weighted
+      // compound scattering moment; 1.0 for a single element. For the thick-scatter path only.
+      double thickScatterCorrection() const { return _thickscatcor; }
       // returns fraction of radiation lengths traversed for a given
       // physical distance through this material
       double radiationFraction(double pathlen) const {
