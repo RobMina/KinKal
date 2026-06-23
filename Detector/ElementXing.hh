@@ -9,6 +9,7 @@
 #include "KinKal/Detector/MaterialXing.hh"
 #include "KinKal/Trajectory/ParticleTrajectory.hh"
 #include "KinKal/Fit/MetaIterConfig.hh"
+#include <cmath>
 #include <vector>
 #include <array>
 #include <ostream>
@@ -34,8 +35,11 @@ namespace KinKal {
       virtual std::vector<MaterialXing>const&  matXings() const =0; // Effect of each physical material component of this detector element on this trajectory
       virtual void print(std::ostream& ost=std::cout,int detail=0) const =0;
       virtual bool active() const =0;
+      virtual bool thickScatter() const { return false; }
       // momentum change and variance increase associated with crossing this element forwards in time, in spatial basis
       void momentumChange(SVEC3& dmom, SMAT& dmomvar) const;
+      // full particle-state change and noise covariance associated with crossing this element forwards in time
+      void particleStateChange(SVEC3& dmom, DMAT& dstatevar, bool thickscat = false) const;
       // parameter change associated with crossing this element forwards in time
       Parameters parameterChange(double varscale=1.0) const;
       // cumulative material effect from all the materials in this element crossing going forwards in time, expressed as scalars
@@ -74,6 +78,65 @@ namespace KinKal {
     }
     // return covariance in global Cartesian coordinates
     dmomvar = ROOT::Math::Similarity(dmdxyz,mmvar);
+  }
+
+  template <class KTRAJ> void ElementXing<KTRAJ>::particleStateChange(SVEC3& dmom, DMAT& dstatevar, bool thickscat) const {
+    // compute the momentum change moving forwards time in global cartesian basis
+    double E = referenceTrajectory().energy();
+    double mom = referenceTrajectory().momentum();
+    double mass = referenceTrajectory().mass();
+
+    double dE(0.0), dEVar(0.0), scatvar(0.0);
+    double perpposvar(0.0), perpposmomcov(0.0);
+    for(auto const& mxing : matXings()){
+      dE += mxing.dmat_.energyLoss(mom,mxing.plen_,mass);
+      dEVar += mxing.dmat_.energyLossVar(mom,mxing.plen_,mass);
+      double const mxscatvar = mxing.dmat_.scatterAngleVar(mom,mxing.plen_,mass);
+      scatvar += mxscatvar;
+      if(thickscat){
+        double const pathlen = std::abs(mxing.plen_);
+        perpposvar += mxscatvar*pathlen*pathlen/3.0;
+        perpposmomcov += mxscatvar*pathlen*mom/2.0;
+      }
+    }
+
+    double const dmdE = E/mom;
+    double const dm = dE*dmdE;
+    double const paramomvar = dEVar*dmdE*dmdE;
+    double const perpmomvar = scatvar*mom*mom;
+
+    auto momdir = referenceTrajectory().direction(time());
+    dmom = dm*SVEC3(momdir.X(),momdir.Y(),momdir.Z());
+
+    if(!thickscat){
+      SMAT dmomvar;
+      momentumChange(dmom,dmomvar);
+      dstatevar = DMAT();
+      dstatevar.Place_at(dmomvar,3,3);
+      return;
+    }
+
+    dstatevar = DMAT();
+    auto addSymOuter = [](DMAT& cov, SVEC6 const& avec, SVEC6 const& bvec, double scale) {
+      for(size_t i=0; i<NParams(); ++i){
+        for(size_t j=0; j<=i; ++j){
+          cov(i,j) += scale*avec[i]*bvec[j];
+        }
+      }
+    };
+
+    SVEC6 momvec(0.0,0.0,0.0,momdir.X(),momdir.Y(),momdir.Z());
+    addSymOuter(dstatevar,momvec,momvec,paramomvar);
+
+    for(int idir=1; idir<MomBasis::ndir; ++idir) {
+      auto pdir = referenceTrajectory().direction(time(),static_cast<MomBasis::Direction>(idir));
+      SVEC6 posvec(pdir.X(),pdir.Y(),pdir.Z(),0.0,0.0,0.0);
+      SVEC6 perpmomvec(0.0,0.0,0.0,pdir.X(),pdir.Y(),pdir.Z());
+      addSymOuter(dstatevar,posvec,posvec,perpposvar);
+      addSymOuter(dstatevar,perpmomvec,perpmomvec,perpmomvar);
+      addSymOuter(dstatevar,posvec,perpmomvec,perpposmomcov);
+      addSymOuter(dstatevar,perpmomvec,posvec,perpposmomcov);
+    }
   }
 
   template <class KTRAJ> Parameters ElementXing<KTRAJ>::parameterChange(double varscale) const {

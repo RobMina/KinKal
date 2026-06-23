@@ -116,6 +116,7 @@ namespace KinKal {
       std::vector<Status> const& history() const { return history_; }
       Status const& fitStatus() const { return history_.back(); } // most recent status
       PKTRAJ const& fitTraj() const { return *fittraj_; }
+      PKTRAJ& fitTrajMutable() { return *fittraj_; }
       KKEFFCOL const& effects() const { return effects_; }
       Config const& config() const { return config_.back(); }
       CONFIGCOL const& configs() const { return config_; }
@@ -870,12 +871,14 @@ namespace KinKal {
         retval = fittraj_->back().range().inRange(exingptr->time());
         if(retval){
           auto& exmat = effects_.emplace_back(std::make_unique<KKMAT>(exingptr,*fittraj_));
+          exmat->updateConfig(config());
           exmat->extrapolate(*fittraj_,tdir);
         }
       } else {
         retval = fittraj_->front().range().inRange(exingptr->time());
         if(retval){
           auto& exmat = effects_.emplace_front(std::make_unique<KKMAT>(exingptr,*fittraj_));
+          exmat->updateConfig(config());
           exmat->extrapolate(*fittraj_,tdir);
         }
       }

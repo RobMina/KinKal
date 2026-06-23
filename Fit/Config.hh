@@ -32,6 +32,7 @@ namespace KinKal {
     unsigned minndof_ = 5; // minimum number of DOFs to continue fit
     bool bfcorr_ = true; // whether to make BFieldMap corrections in the fit
     bool ends_ = true; // process the passive effects at each end of the track after schedule completion
+    bool thickscat_ = false; // add correlated position/momentum scattering noise for material extrapolation
     printLevel plevel_ = none; // print level
     // schedule of meta-iterations.  These will be executed sequentially until completion or failure
     Schedule schedule_;

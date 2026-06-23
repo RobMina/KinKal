@@ -23,7 +23,7 @@ namespace KinKal {
       bool active() const override { return  exingptr_->active(); }
       void process(FitState& kkdata,TimeDir tdir) override;
       void updateState(MetaIterConfig const& miconfig,bool first) override;
-      void updateConfig(Config const& config) override {}
+      void updateConfig(Config const& config) override { thickscat_ = config.thickscat_; }
       void append(PTRAJ& fit,TimeDir tdir) override;
       void extrapolate(PTRAJ& fit,TimeDir tdir) override;
       void updateReference(PTRAJ const& ptraj) override;
@@ -43,6 +43,7 @@ namespace KinKal {
     private:
       EXINGPTR exingptr_; // element crossing for this effect
       Weights nextwt_; // cache of weight forwards of this effect.
+      bool thickscat_ = false; // add correlated thick-scatter noise in extrapolation
 
       // modifiers to support cloning
       void setElementXingPtr(EXINGPTR const& ptr){ exingptr_ = ptr; }
@@ -109,10 +110,16 @@ namespace KinKal {
     auto bnom = ktrajptr->bnom();
     // change in momentum due to the associated element Xing
     SVEC3 dmom;
-    SMAT dmomvar;
-    exingptr_->momentumChange(dmom,dmomvar);
-    // expand these to the full particle state, with null position and cross-covariance
-    DMAT dstatevar; dstatevar.Place_at(dmomvar,3,3); // lower right corner for momentum
+    DMAT dstatevar;
+    bool const useThickScatter = thickscat_ || exingptr_->thickScatter();
+    exingptr_->particleStateChange(dmom,dstatevar,useThickScatter);
+    if(tdir == TimeDir::backwards && useThickScatter){
+      for(size_t ipos=0; ipos<3; ++ipos){
+        for(size_t imom=3; imom<NParams(); ++imom){
+          dstatevar(ipos,imom) *= -1.0;
+        }
+      }
+    }
     auto psvar = pstate.stateCovariance() + dstatevar;
     SVEC6 dstate; dstate.Place_at(dmom,3);
     // update the pstate accordingly. momentum vector change depends on the time direction, but not the covariance
@@ -154,7 +161,8 @@ namespace KinKal {
   // clone op for reinstantiation
   template <class KTRAJ>
   Material<KTRAJ>::Material(Material const& rhs):
-    nextwt_(rhs.weights()){
+    nextwt_(rhs.weights()),
+    thickscat_(rhs.thickscat_){
     /**/
   }
 

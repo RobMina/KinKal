@@ -10,6 +10,7 @@ namespace KinKal {
       << " fractional momentum tolerance " << kkconfig.tol_
       << " min NDOF " << kkconfig.minndof_
       << " BField correction " << kkconfig.bfcorr_
+      << " thick scatter extrapolation " << kkconfig.thickscat_
       << " with " << kkconfig.schedule().size()
       << " Meta-iterations:" << std::endl;
     for(auto const& miconfig : kkconfig.schedule() ) {
