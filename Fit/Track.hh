@@ -476,13 +476,15 @@ namespace KinKal {
     } else {
       // use the middle of the range as the nominal BField for this fit:
       double tref = range.mid();
-      auto bf = bfield_.usableField(seedtraj.position3(tref));
-      if(!bf){
+      // no map is required here: a field-free fit (KinematicLine, field off) legitimately samples a null field.
+      // Only a trajectory that can't represent the seed in this field refuses it.
+      VEC3 bf = bfield_.fieldVect(seedtraj.position3(tref));
+      if(!KTRAJ::constructible(seedtraj.state(tref),bf)){
         history_.emplace_back(0,0,Status::outsidemap, "Seed conversion: unusable field at reference");
         return;
       }
       // create the first piece.  Note this constructor adjusts the parameters according to the local field
-      KTRAJ firstpiece(seedtraj,*bf,tref);
+      KTRAJ firstpiece(seedtraj,bf,tref);
       firstpiece.range() = range;
       // create the piecewise trajectory from this
       fittraj_ = std::make_unique<PKTRAJ>(firstpiece);
