@@ -303,18 +303,11 @@ namespace KinKal {
           }
         }
       } else {
-        // create domains just for the extensions
-        TimeRange exlow(exrange.begin(),fittraj_->range().begin());
-        if(exlow.range()>0.0) {
-          DOMAINCOL lowdomains;
-          dok &= createDomains(*fittraj_,exlow, lowdomains);
-          if(dok)domains.insert(lowdomains.begin(),lowdomains.end());
-        }
-        TimeRange exhigh(fittraj_->range().end(),exrange.end());
-        if(exhigh.range()>0.0){
-          DOMAINCOL highdomains;
-          dok &= createDomains(*fittraj_,exhigh, highdomains);
-          if(dok)domains.insert(highdomains.begin(),highdomains.end());
+        // grow the existing domains out to the extension, so each new domain abuts and is DomainWall-linked to its neighbor
+        try {
+          extendDomains(exrange);
+        } catch (std::exception const&) {
+          dok = false; // walked outside the field map: same soft failure the replaced createDomains calls gave
         }
       }
     }
