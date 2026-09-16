@@ -153,7 +153,7 @@ namespace KinKal {
       void initFitState(FitStateArray& states, TimeRange const& fitrange, double dwt=1.0);
       PKTRAJPTR initTraj(FitState& state, TimeRange const& fitrange);
       bool canIterate() const;
-      bool replaceDomains(DOMAINCOL const& domains);
+      std::optional<Status> replaceDomains(DOMAINCOL const& domains); // the failure, or nothing on success
       void extendTraj(DOMAINCOL const& domains);
       void processEnds();
       // add a single domain within the tolerance and extend the fit in the specified direction.
@@ -290,14 +290,11 @@ namespace KinKal {
           // Map-edge stop before any domain: do not call replaceDomains on an empty set.
           dok = false;
         } else if(dok){
-          // a tighter extension tolerance can flip omega near a collapsing field, which the
-          // parameterization reads as a charge change; leave the track untouched and record why
-          if(!replaceDomains(domains)){
+          // a failed replacement leaves the track untouched and reports why
+          if(auto failure = replaceDomains(domains)){
             // A fit that already converged is not invalidated by the EXTENSION failing to re-domain it: keep it.
             if(bfield_.protecting() && fitStatus().usable()) return;
-            history_.push_back(Status(0));
-            status().status_ = Status::incompatiblepiece;
-            status().comment_ = std::string("Domain replacement: incompatible piece");
+            history_.push_back(*failure);
             return;
           }
         }
@@ -330,20 +327,21 @@ namespace KinKal {
 
   // replace domains when DomainWall correction is added or changed. the traj must also be replaced, so that
   // the pieces correspond to the new domains. The new traj is geometrically equivalent, but not parametrically equal.
-  // Two-phase: build the replacement without touching any member, then commit. Returns false, leaving
-  // the track untouched, if a transformed piece cannot describe the same particle as those before it.
-  template <class KTRAJ> bool Track<KTRAJ>::replaceDomains(DOMAINCOL const& domains) {
-    if(domains.size() == 0) return false;
+  // Two-phase: build the replacement without touching any member, then commit. On failure the track is
+  // untouched and the returned Status says why; on success nothing is returned.
+  template <class KTRAJ> std::optional<Status> Track<KTRAJ>::replaceDomains(DOMAINCOL const& domains) {
+    if(domains.size() == 0) return Status(0,0,Status::outsidemap,"Domain replacement: no domains");
     TimeRange drange(domains.begin()->get()->begin(),domains.rbegin()->get()->end());
     auto newtraj = std::make_unique<PKTRAJ>();
     // Split from a COPY extended to the domain span, so fittraj_ stays untouched until the commit below
     // (the copy ctor deep-copies every piece).
     PKTRAJ srctraj(*fittraj_);
-    // setRange throws when the domain span is disjoint from the trajectory. Here that is a routine
-    // outcome, not an error -- report it like any other failure to re-domain, so the caller can keep a
-    // fit that already converged, instead of the exception unwinding out to the module and losing it.
+    // setRange throws when the domain span doesn't reach the first and last trajectory pieces (e.g. domains
+    // stopped at the map edge). Here that is a routine outcome, not an error -- report it, so the caller can
+    // keep a fit that already converged, instead of the exception unwinding out to the module and losing it.
     if(drange.begin() > srctraj.front().range().end() ||
-       drange.end() < srctraj.back().range().begin()) return false;
+       drange.end() < srctraj.back().range().begin())
+      return Status(0,0,Status::outsidemap,"Domain replacement: domains don't span the trajectory");
     srctraj.setRange(drange);
     // loop over domains, splitting the overlapping traj pieces at the domain walls, and transforming them to reference the domain's field
     // This increases the number of traj pieces.
@@ -364,15 +362,16 @@ namespace KinKal {
         double tstart = std::max(domain->begin(), oldpiece.range().begin());
         double tend = std::min(domain->end(),oldpiece.range().end());
         if(tstart < tend){
-          // test only pieces that are appended; append throws on an incompatible piece
-          if(!newtraj->compatible(newpiece)) return false;
+          // test only pieces that are appended; append throws on an incompatible piece. A new tolerance can
+          // flip omega near a collapsing field, which the parameterization reads as a charge change.
+          if(!newtraj->compatible(newpiece)) return Status(0,0,Status::incompatiblepiece,"Domain replacement: incompatible piece");
           newpiece.range() = TimeRange(tstart,tend);
           newtraj->append(newpiece);
         }
         if(olditer != last)++olditer;
       } while(olditer != last);
     }
-    if(newtraj->pieces().size() == 0) return false;
+    if(newtraj->pieces().size() == 0) return Status(0,0,Status::failed,"Domain replacement: no trajectory pieces");
     // commit: clear the existing domains / DomainWall effects, retarget remaining effects, swap traj
     if(domains_.size() > 0){
       domains_.clear();
@@ -390,7 +389,7 @@ namespace KinKal {
       eff->updateReference(*newtraj);
     }
     fittraj_.swap(newtraj);
-    return true;
+    return std::nullopt;
   }
 
   template <class KTRAJ> void Track<KTRAJ>::extendTraj(DOMAINCOL const& domains ) {
