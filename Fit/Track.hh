@@ -293,8 +293,7 @@ namespace KinKal {
           // a tighter extension tolerance can flip omega near a collapsing field, which the
           // parameterization reads as a charge change; leave the track untouched and record why
           if(!replaceDomains(domains)){
-            // A fit that already converged is not invalidated by the EXTENSION failing to re-domain it:
-            // keep it, as the low-field handoff did before this returned a status instead of throwing.
+            // A fit that already converged is not invalidated by the EXTENSION failing to re-domain it: keep it.
             if(bfield_.protecting() && fitStatus().usable()) return;
             history_.push_back(Status(0));
             status().status_ = Status::incompatiblepiece;
@@ -307,12 +306,12 @@ namespace KinKal {
         try {
           extendDomains(exrange);
         } catch (std::exception const&) {
-          dok = false; // walked outside the field map: same soft failure the replaced createDomains calls gave
+          dok = false; // walked outside the field map: soft failure, reported below as an extension error
         }
       }
     }
     if(!dok){
-      // domain calculation failed. Under low-field protection, keep a previously usable fit
+      // domain calculation failed. Under low-field protection, keep an already usable fit
       // (map-edge truncation is preferred inside createDomains; this is a safety net).
       if(bfield_.protecting() && fitStatus().usable()) return;
       history_.push_back(Status(0));
@@ -337,9 +336,8 @@ namespace KinKal {
     if(domains.size() == 0) return false;
     TimeRange drange(domains.begin()->get()->begin(),domains.rbegin()->get()->end());
     auto newtraj = std::make_unique<PKTRAJ>();
-    // Split from a COPY extended to the domain span. The original code extended fittraj_ itself and
-    // rolled its end-piece ranges back on failure; copying keeps the piece splitting identical to that
-    // (the copy ctor deep-copies every piece) while leaving fittraj_ untouched until the commit below.
+    // Split from a COPY extended to the domain span, so fittraj_ stays untouched until the commit below
+    // (the copy ctor deep-copies every piece).
     PKTRAJ srctraj(*fittraj_);
     // setRange throws when the domain span is disjoint from the trajectory. Here that is a routine
     // outcome, not an error -- report it like any other failure to re-domain, so the caller can keep a
@@ -366,7 +364,7 @@ namespace KinKal {
         double tstart = std::max(domain->begin(), oldpiece.range().begin());
         double tend = std::min(domain->end(),oldpiece.range().end());
         if(tstart < tend){
-          // test only where the old code would actually have appended (and thrown)
+          // test only pieces that are appended; append throws on an incompatible piece
           if(!newtraj->compatible(newpiece)) return false;
           newpiece.range() = TimeRange(tstart,tend);
           newtraj->append(newpiece);
@@ -375,7 +373,7 @@ namespace KinKal {
       } while(olditer != last);
     }
     if(newtraj->pieces().size() == 0) return false;
-    // commit: clear old domains / DomainWall effects, retarget remaining effects, swap traj
+    // commit: clear the existing domains / DomainWall effects, retarget remaining effects, swap traj
     if(domains_.size() > 0){
       domains_.clear();
       auto ieff = effects_.begin();
@@ -459,8 +457,8 @@ namespace KinKal {
         }
         KTRAJ newpiece(seedtraj,*bf,domain->mid());
         newpiece.range() = domain->range();
-        // same routine incompatibility as replaceDomains; this append was previously unguarded, so a
-        // CentralHelix omega sign flip here threw std::invalid_argument out of the Track constructor
+        // same routine incompatibility as replaceDomains: a CentralHelix omega sign flip here would make
+        // append throw std::invalid_argument out of the Track constructor
         if(!fittraj_->compatible(newpiece)){
           history_.emplace_back(0,0,Status::incompatiblepiece, "Seed conversion: incompatible piece");
           return;
@@ -834,7 +832,7 @@ namespace KinKal {
     }
     ost << " Fit Result ";
     // convertSeed returns before fittraj_ is built when domain initialization fails, so a soft-failed
-    // fit has no trajectory to print; dereferencing it here segfaulted
+    // fit has no trajectory to print; dereferencing it here would segfault
     if(!hasTraj()){
       ost << "(no trajectory: " << fitStatus().comment_ << ")" << endl;
       return;
@@ -859,7 +857,7 @@ namespace KinKal {
     if(dhi <= tstart) return std::nullopt;
     TimeRange drange(tstart,dhi);
     // the domain carries the field sampled at its midpoint. Requiring that sample to be usable is what
-    // protection buys; unprotected, fieldVect just reports null outside the map, as it always did.
+    // protection buys; unprotected, fieldVect reports a null field outside the map.
     // Sample the midpoint on the midpoint's own piece only when confined (domainmargin_ set); the
     // unconfined walk samples it on the start piece, as extendDomains does.
     bool confined = config().domainmargin_ < std::numeric_limits<double>::max();
@@ -876,7 +874,7 @@ namespace KinKal {
   template<class KTRAJ> bool Track<KTRAJ>::createDomains(PKTRAJ const& ptraj, TimeRange const& range, DOMAINCOL& domains) const {
     if(!config().bfcorr_) return true;
     // No usable domain means: soft stop when protection is on (keep what we have, let the caller
-    // proceed), otherwise the failure the map used to signal by throwing out of fieldDeriv.
+    // proceed), otherwise a failure.
     if(config().domainmargin_ < std::numeric_limits<double>::max()){
       // confined (domainmargin_ set): walk only within the active range +/- margin, clipping the last domain
       double const tlo = range.begin() - config().domainmargin_;
@@ -890,7 +888,7 @@ namespace KinKal {
       }
     } else {
       // Unconfined (default): half-domain overhang so the first/last effect sits mid-domain. The loop
-      // bound tracks the current step, as upstream, so domains are unclipped and full length.
+      // bound tracks the current step, so domains are unclipped and full length.
       auto const& ktraj0 = ptraj.nearestPiece(range.begin());
       if(!bfield_.usable(ktraj0.position3(range.begin()))) return bfield_.protecting();
       double trange = bfield_.domainStep(ktraj0,range.begin(),config().tol_,config().mindtstep_);
@@ -932,7 +930,7 @@ namespace KinKal {
     if(retval){
       if(config().bfcorr_){
         // opt-in low-field handoff, for extrapolation that must leave the field map; with minfield_ 0
-        // the unprotected domain walk below is used unchanged
+        // the unprotected domain walk below is used
         if(bfield_.protecting()){
           auto geometricExtend = [&](double tmax_remaining) {
             if(tmax_remaining <= 0.0) return;
@@ -990,7 +988,7 @@ namespace KinKal {
             geometricExtend(xtest.maxDt() - fabs(time-tstart));
           }
         } else {
-          // no low-field protection: the unprotected bfcorr domain walk, unchanged
+          // no low-field protection: the unprotected bfcorr domain walk
           try {
             double time = tdir == TimeDir::forwards ? domains_.crbegin()->get()->end() : domains_.cbegin()->get()->begin();
             double tstart = time;
