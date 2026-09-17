@@ -211,6 +211,11 @@ namespace KinKal {
     // truncate the domains and fit trajectory to be within the detector range
     auto detrange = detectorRange(hits,exings,true);
     if(!validInput(detrange)) return;
+    // a field-corrected fit walks its domains from the existing ones, so it needs at least one
+    if(config().bfcorr_ && domains.empty()){
+      history_.emplace_back(0,0,Status::outsidemap, "No domains for a field-corrected fit");
+      return;
+    }
     if(domains.size() > 0){
       auto idom = domains.begin();
       // stop at the 1st domain overlaping the detector range, and erase all elements up to that point
@@ -286,14 +291,9 @@ namespace KinKal {
         // create domains for the whole range
         dok &= createDomains(*fittraj_,exrange, domains);
         // replace previous  domains with these.  This replaces the trajectory and bfield-related effects
-        if(bfield_.protecting() && dok && domains.empty()){
-          // Map-edge stop before any domain: do not call replaceDomains on an empty set.
-          dok = false;
-        } else if(dok){
-          // a failed replacement leaves the track untouched and reports why
+        if(dok){
+          // a failed replacement leaves the track untouched and reports why; the extension failed, so the fit is marked failing
           if(auto failure = replaceDomains(domains)){
-            // A fit that already converged is not invalidated by the EXTENSION failing to re-domain it: keep it.
-            if(bfield_.protecting() && fitStatus().usable()) return;
             history_.push_back(*failure);
             return;
           }
@@ -308,9 +308,7 @@ namespace KinKal {
       }
     }
     if(!dok){
-      // domain calculation failed. Under low-field protection, keep an already usable fit
-      // (map-edge truncation is preferred inside createDomains; this is a safety net).
-      if(bfield_.protecting() && fitStatus().usable()) return;
+      // domain calculation failed: the extension failed, so the fit is marked failing
       history_.push_back(Status(0));
       status().status_ = Status::outsidemap;
       status().comment_ = std::string("Extension error");
@@ -364,7 +362,7 @@ namespace KinKal {
         if(tstart < tend){
           // test only pieces that are appended; append throws on an incompatible piece. A new tolerance can
           // flip omega near a collapsing field, which the parameterization reads as a charge change.
-          if(!newtraj->compatible(newpiece)) return Status(0,0,Status::incompatiblepiece,"Domain replacement: incompatible piece");
+          if(!newtraj->compatible(newpiece)) return Status(0,0,Status::unphysical,"Domain replacement: unphysical piece");
           newpiece.range() = TimeRange(tstart,tend);
           newtraj->append(newpiece);
         }
@@ -459,7 +457,7 @@ namespace KinKal {
         // same routine incompatibility as replaceDomains: a CentralHelix omega sign flip here would make
         // append throw std::invalid_argument out of the Track constructor
         if(!fittraj_->compatible(newpiece)){
-          history_.emplace_back(0,0,Status::incompatiblepiece, "Seed conversion: incompatible piece");
+          history_.emplace_back(0,0,Status::unphysical, "Seed conversion: unphysical piece");
           return;
         }
         fittraj_->append(newpiece);
@@ -980,10 +978,21 @@ namespace KinKal {
           } catch (std::exception const& error) {
             history_.push_back(Status(0));
             status().status_ = Status::outsidemap;
-            status().comment_ = std::string("Extrapolation error");
+            status().comment_ = std::string("Extrapolation error: ") + error.what();
             retval = false;
           }
           if(retval && handed_off && xtest.needsExtrapolation(*fittraj_,tdir)){
+            // record the handoff once per direction: the fit stays usable, but this part of the extrapolation isn't field-corrected.
+            // Look back through the trailing run of handoff entries, so alternating directions don't repeat.
+            static const std::string handoffprefix("Extrapolation: low-field handoff to geometric continuation ");
+            std::string handoff = handoffprefix + (tdir == TimeDir::forwards ? "forwards" : "backwards");
+            bool recorded(false);
+            for(auto ihist = history_.crbegin(); ihist != history_.crend() && ihist->comment_.rfind(handoffprefix,0) == 0; ++ihist)
+              recorded |= ihist->comment_ == handoff;
+            if(!recorded){
+              history_.push_back(fitStatus());
+              status().comment_ = handoff;
+            }
             geometricExtend(xtest.maxDt() - fabs(time-tstart));
           }
         } else {
@@ -1003,7 +1012,7 @@ namespace KinKal {
           } catch (std::exception const& error) {
             history_.push_back(Status(0));
             status().status_ = Status::outsidemap;
-            status().comment_ = std::string("Extrapolation error");
+            status().comment_ = std::string("Extrapolation error: ") + error.what();
             retval = false;
           }
           retval = true;
