@@ -45,23 +45,16 @@ namespace KinKal {
       // parameters WRT which this hit's residual and weights are set.  These are generally biased
       // in that they contain the information of this hit
       Parameters const& referenceParameters() const { return referenceTrajectory().params(); }
-      // record the fit that was just run: the piece of its trajectory holding this hit's weight, and the weight and state applied
-      void snapshotWeight(KTRAJ const& wpiece);
-      // Unbiased parameters WRT the reference: this hit's weight removed from the piece it was applied to.  Computed once
-      // from the last snapshot and cached, so later state changes don't alter it.
-      // Describe the fit that produced the current reference; decided one fit cycle earlier.
-      Parameters const& unbiasedParameters() const;
+      // record the parameters of the piece of a new fit trajectory that holds this hit's weight
+      void setWeightParameters(Parameters const& wpars) { wpars_ = wpars; }
+      // Unbiased parameters WRT the reference: this hit's weight removed from the piece it was applied to.  These describe
+      // the fit that produced the current reference; the hit's state was decided one fit cycle earlier, against the
+      // previous reference
+      Parameters unbiasedParameters() const;
       // unbiased least-squares distance to reference parameters
       Chisq chisquared() const;
     private:
-      struct WeightSnapshot {
-        Parameters wpars_; // parameters of the piece the weight was applied to
-        Weights weight_; // weight applied
-        bool active_; // state applied
-      };
-      std::optional<WeightSnapshot> wsnap_; // empty until the first snapshot (eg cloned hits)
-      mutable std::optional<Parameters> upars_; // cached unbiased parameters
-      mutable KTRAJPTR uref_; // reference trajectory the cache refers to
+      std::optional<Parameters> wpars_; // parameters of the piece the weight was applied to; empty until set (eg cloned hits)
   };
 
   // cloning requires domain knowledge of pointer members of the cloned object,
@@ -72,31 +65,21 @@ namespace KinKal {
     throw std::runtime_error(msg);
   }
 
-  template<class KTRAJ> void Hit<KTRAJ>::snapshotWeight(KTRAJ const& wpiece) {
-    wsnap_ = WeightSnapshot{wpiece.params(), weight(), active()};
-    upars_.reset();
-  }
-
-  template<class KTRAJ> Parameters const& Hit<KTRAJ>::unbiasedParameters() const {
-    // recompute only after a new snapshot or if the reference moved without one
-    if(upars_ && uref_ == refTrajPtr()) return *upars_;
-    uref_ = refTrajPtr();
-    // without a snapshot, the weight is taken as applied to the reference
-    bool wactive = wsnap_ ? wsnap_->active_ : active();
-    if(wactive){
+  template<class KTRAJ> Parameters Hit<KTRAJ>::unbiasedParameters() const {
+    if(active()){
       // remove this hit's weight from the piece it was applied to: removing it from another piece, separated by
-      // material effects, over-subtracts and can leave a covariance that isn't positive definite.
-      Parameters const& wpars = wsnap_ ? wsnap_->wpars_ : referenceParameters();
+      // material effects, over-subtracts and can leave a covariance that isn't positive definite.  Without a
+      // recorded piece, the weight is taken as applied to the reference
+      Parameters const& wpars = wpars_ ? *wpars_ : referenceParameters();
       Weights wt(wpars);
-      wt -= wsnap_ ? wsnap_->weight_ : weight();
+      wt -= weight();
       Parameters upars(wt);
       // express the result WRT the reference: apply the parameter change from removing this hit to the reference
       // parameters, keeping the unbiased covariance.  Identical to the plain subtraction when the pieces coincide
       upars.parameters() += referenceParameters().parameters() - wpars.parameters();
-      upars_ = upars;
+      return upars;
     } else
-      upars_ = referenceParameters();
-    return *upars_;
+      return referenceParameters();
   }
 
   template<class KTRAJ> Chisq Hit<KTRAJ>::chisquared() const {
