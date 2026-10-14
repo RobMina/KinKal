@@ -3,6 +3,7 @@
 #include "G4EmCalculator.hh"
 #include "G4EmParameters.hh"
 #include "G4HadronicParameters.hh"
+#include "G4IonisParamMat.hh"
 #include "G4LogicalVolume.hh"
 #include "G4NistManager.hh"
 #include "G4PVPlacement.hh"
@@ -50,6 +51,7 @@ struct Config {
   std::string physicsList = "ShieldingM";
   long seed = 12345;
   bool predictOnly = false;    // skip Geant4 entirely; emit only the KinKal + two-plane predictions
+  bool ionDiag = false;        // dump the KinKal-vs-Geant4 ionisation parameters (I, density effect)
 };
 
 constexpr double kMuonMassMeV = 105.6583745;
@@ -160,6 +162,19 @@ std::unique_ptr<MatEnv::DetMaterial> makeKinKalMaterial(std::string const& name)
   MatEnv::DetMaterialConfig config;
   config.elossmode_ = MatEnv::DetMaterial::moyalmean;
   return std::make_unique<MatEnv::DetMaterial>(name.c_str(), properties.get(), config);
+}
+
+// Build the Geant4 material from the shared registry (no RunManager needed; G4IonisParamMat — the
+// mean excitation energy and density-effect parameters — is computed at G4Material construction).
+G4Material* buildSlabMaterial(std::string const& name) {
+  if(auto* existing = G4Material::GetMaterial(name, false)) return existing;
+  MaterialSpec const spec = materialSpec(name);
+  auto* nist = G4NistManager::Instance();
+  auto* mat = new G4Material(name, spec.density*CLHEP::g/CLHEP::cm3,
+                             static_cast<int>(spec.elements.size()));
+  for(auto const& elem : spec.elements)
+    mat->AddElement(nist->FindOrBuildElement(elem.name), elem.fraction);
+  return mat;
 }
 
 class StraightTrajectory {
@@ -340,14 +355,7 @@ public:
 
 private:
   static G4Material* findOrBuildMaterial(std::string const& name) {
-    if(auto* existing = G4Material::GetMaterial(name, false)) return existing;
-    // build from the shared registry so Geant4 and KinKal use identical composition + density
-    MaterialSpec const spec = materialSpec(name);
-    auto* nist = G4NistManager::Instance();
-    auto* mat = new G4Material(name, spec.density*g/cm3, static_cast<int>(spec.elements.size()));
-    for(auto const& elem : spec.elements)
-      mat->AddElement(nist->FindOrBuildElement(elem.name), elem.fraction);
-    return mat;
+    return buildSlabMaterial(name); // shared registry: Geant4 and KinKal use identical composition
   }
 
   Config const& cfg_;
@@ -470,6 +478,7 @@ Config parseArgs(int argc, char** argv) {
     else if(arg == "--physics-list") cfg.physicsList = value(arg);
     else if(arg == "--seed") cfg.seed = std::atol(value(arg).c_str());
     else if(arg == "--predict-only") cfg.predictOnly = true;
+    else if(arg == "--ion-diag") cfg.ionDiag = true;
     else if(arg == "--help"){
       std::cout << "Usage: ThickSlabG4 [--events N] [--momentum MeV] "
                    "[--thickness mm] [--max-step mm] [--material NAME] "
@@ -534,6 +543,49 @@ int main(int argc, char** argv) {
   runManager->SetUserAction(new PrimaryGun(cfg));
   runManager->SetUserAction(new ExitRecorder(cfg, moments));
   runManager->Initialize();
+
+  if(cfg.ionDiag){
+    // Pin the ~2% dE offset: dump KinKal's ionisation inputs (mean excitation energy I and the
+    // Sternheimer density-effect coefficients + delta(betagamma)) and compare the resulting
+    // ionization dE/dx to Geant4's, point-by-point in betagamma, via G4EmCalculator (the EM physics
+    // tables are built by the BeamOn(1) below).  A flat dE/dx residual fingerprints an I offset; a
+    // betagamma-dependent residual fingerprints the density-effect (delta).
+    runManager->BeamOn(1); // build the EM physics tables for G4EmCalculator
+    auto kk = makeKinKalMaterial(cfg.material);
+    auto const* muon = G4ParticleTable::GetParticleTable()->FindParticle("mu-");
+    double const mass = muon->GetPDGMass()/MeV;
+    auto const* g4mat = detector->slabMaterial();
+    auto* ion = g4mat->GetIonisation();
+    G4EmCalculator emcalc;
+    std::cout << std::setprecision(6)
+              << "ion_diag 1\n"
+              << "material " << cfg.material << "\n"
+              << "I_kinkal_eV " << kk->eexc()*1.0e6 << "\n"
+              << "I_g4_eV " << ion->GetMeanExcitationEnergy()/CLHEP::eV << "\n"
+              << "# Sternheimer density-effect coefficients: x0 x1 Cbar a m\n"
+              << "sternheimer_kinkal " << kk->X0() << " " << kk->X1() << " "
+                                       << kk->bigC() << " " << kk->aFactor() << " " << kk->mPower() << "\n"
+              << "sternheimer_g4 " << ion->GetX0density() << " " << ion->GetX1density() << " "
+                                   << ion->GetCdensity() << " " << ion->GetAdensity() << " "
+                                   << ion->GetMdensity() << "\n"
+              << "# p(MeV/c) betagamma delta_kk delta_g4 dEdx_kk_MeVmm dEdx_g4_MeVmm resid\n";
+    for(double p : {300.0, 600.0, 1000.0, 2000.0, 4000.0, 8000.0}){
+      double const bg = p/mass;
+      double const bg2 = bg*bg;
+      double const x = std::log10(bg);
+      double const dkk = kk->densityCorrection(bg2);
+      double const dg4 = ion->DensityCorrection(x);
+      double const dedx_kk = -kk->ionizationEnergyLossMean(p, 1.0, mass); // MeV/mm
+      double const kinE = std::sqrt(p*p + mass*mass) - mass;
+      double const dedx_g4 = emcalc.ComputeTotalDEDX(kinE*MeV, muon, g4mat)/(MeV/mm);
+      double const resid = (dedx_kk - dedx_g4)/dedx_g4;
+      std::cout << "iondedx " << p << " " << bg << " " << dkk << " " << dg4 << " "
+                << dedx_kk << " " << dedx_g4 << " " << resid << "\n";
+    }
+    delete runManager;
+    return 0;
+  }
+
   runManager->BeamOn(cfg.events);
 
   if(moments.n == 0) throw std::runtime_error("No primary muons exited the slab");
