@@ -460,7 +460,24 @@ namespace KinKal {
     VEC3 dBloc = g2l_(dB);
     // find the parameter change due to BField magnitude change using component parallel to the local nominal Bfield (always along z)
     double bfrac = dBloc.Z()/bnom_.R();
-    DVEC retval = dPardB(time)*bfrac/(1.0 + bfrac);
+    DVEC retval;
+    if(bfrac != 0.0){
+      // exact at fixed state: omega and Omega scale with 1+bfrac, the circle centre slides along (centre - position) as the
+      // radius scales with 1/(1+bfrac), and the phase at 'time' is kept, so z0 and t0 stay on the same winding
+      auto xvec = localPosition(time);
+      VEC3 xperp(xvec.X(),xvec.Y(),0.0);
+      VEC3 cnew = xperp + (center() - xperp)*(1.0/(1.0 + bfrac));
+      double dphi0 = remainder(atan2(cnew.Y(),cnew.X()) - sign()*M_PI_2 - phi0(), 2*M_PI);
+      double phi0new = phi0() + dphi0;
+      double omnew = omega()*(1.0 + bfrac);
+      double rcnew = cnew.X()*sin(phi0new) - cnew.Y()*cos(phi0new);
+      double phit = phi(time);
+      retval[omega_] = omnew - omega();
+      retval[d0_] = -1.0/omnew - rcnew - d0();
+      retval[phi0_] = dphi0;
+      retval[z0_] = xvec.Z() - tanDip()*(phit - phi0new)/omnew - z0();
+      retval[t0_] = time - (phit - phi0new)/(Omega()*(1.0 + bfrac)) - t0();
+    }
     // find the change in (local) position and momentum due to the rotation implied by the B direction change
     // work in local coordinate system to avoid additional matrix mulitplications
     auto xvec = localPosition(time);
