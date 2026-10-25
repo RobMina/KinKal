@@ -49,6 +49,7 @@
 #include "KinKal/General/TimeRange.hh"
 #include "KinKal/General/TimeDir.hh"
 #include "TMath.h"
+#include <memory>
 #include <set>
 #include <vector>
 #include <deque>
@@ -114,6 +115,15 @@ namespace KinKal {
       template <class XTEST> bool extrapolate(TimeDir tdir, XTEST const& XTest);
       // extrapolate the fit through a material xing. Return value is true if the effect is added and fit updated.
       bool extrapolate(EXINGPTR const& exing,TimeDir const& tdir);
+      struct RejectionTrace {
+        Status status;
+        KTRAJ candidateFront, referenceFront, candidateBack, referenceBack;
+        size_t referenceFrontIndex, referenceBackIndex;
+        DVEC frontStep, backStep;
+        double frontChi2, backChi2, threshold, averageGap, deltaChi2;
+      };
+      void captureRejection(bool enable) { captureRejection_ = enable; rejectionTrace_.reset(); }
+      RejectionTrace const* rejectionTrace() const { return rejectionTrace_.get(); }
       // accessors
       std::vector<Status> const& history() const { return history_; }
       Status const& fitStatus() const { return history_.back(); } // most recent status
@@ -167,6 +177,8 @@ namespace KinKal {
       auto& status() { return history_.back(); } // most recent status
       // divide a trajectory into magnetic 'domains' within which the BField can be considered constant (parameter change is within tolerance)
       // payload
+      bool captureRejection_ = false;
+      std::unique_ptr<RejectionTrace> rejectionTrace_;
       CONFIGCOL config_; // configuration
       BFieldMap const& bfield_; // magnetic field map
       std::vector<Status> history_; // fit status history; records the current iteration
@@ -715,6 +727,12 @@ namespace KinKal {
       status().status_ = Status::gapdiverged;
     } else if (dpchisqfront > config().pdchisq_ || dpchisqback > config().pdchisq_) {
       status().status_ = Status::paramsdiverged;
+      if(captureRejection_ && !rejectionTrace_) {
+        rejectionTrace_ = std::make_unique<RejectionTrace>(RejectionTrace{
+          status(), ffront, sfront, fback, sback,
+          fittraj_->nearestIndex(ffront.range().mid()), fittraj_->nearestIndex(fback.range().mid()),
+          dpfront, dpback, dpchisqfront, dpchisqback, config().pdchisq_, avggap, dchisq});
+      }
     } else if (dchisq > config().divdchisq_) {
       status().status_ = Status::chisqdiverged;
     } else if (status().chisq_.nDOF() < (int)config().minndof_){
